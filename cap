@@ -1,0 +1,743 @@
+import os
+# --- Suppress excessive logging and disable Gymnasium's env checker ---
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"          # Only errors from TF
+os.environ["GYM_DISABLE_ENV_CHECKER"] = "True"       # Disable Gymnasium's passive env checker
+os.environ["RAY_DEDUP_LOGS"] = "1"                   # Reduce duplicate Ray logs
+
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
+import ray
+from ray.rllib.algorithms.ppo import PPOConfig
+from ray.rllib.policy.policy import PolicySpec
+from ray.rllib.env.multi_agent_env import MultiAgentEnv
+from tqdm import tqdm
+import time
+from datetime import datetime
+
+# For hyperparameter tuning
+from ray import tune
+from ray.tune import grid_search
+
+# --- Register the multi-agent environment with Gymnasium ---
+from gymnasium.envs.registration import register
+register(
+    id="D2D-MA-v0",
+    entry_point="__main__:D2DMultiAgentEnv",
+)
+
+# =========================
+# PARAMETERS & GLOBALS
+# =========================
+NUM_AGENTS = 5
+SEED = 42  # For reproducibility
+np.random.seed(SEED)
+
+# For multi-policy mapping: assign a unique policy to each agent
+def multi_policy_mapping_fn(agent_id, *args, **kwargs):
+    return agent_id
+
+# =========================
+# CUSTOM D2D ENVIRONMENT WITH IMPROVED CHANNEL MODEL
+# =========================
+class D2DMultiAgentEnv(MultiAgentEnv):
+    def __init__(self, config=None):
+        super().__init__()
+        if config is None:
+            config = {}
+        self._num_agents = config.get("num_agents", NUM_AGENTS)
+        self.max_steps = config.get("max_steps", 100)
+        self.bandwidth = config.get("bandwidth", 50e6)  # 50 MHz
+        self.noise_power = config.get("noise_power", 1e-10)  # Lower noise for better SINR
+        self.current_step = 0
+        self.speed = config.get("speed", 0.01)  # Mobility speed
+
+        # Additional parameters for channel modeling
+        self.path_loss_exponent = config.get("path_loss_exponent", 3.5)
+        self.fading_scale = config.get("fading_scale", 1.0)
+        self.shadowing_std = config.get("shadowing_std", 8.0)  # dB
+        self.channel_correlation = config.get("channel_correlation", 0.7)
+        self.prev_channel_gains = None
+
+        # Define agents (each agent identified by "agent_0", "agent_1", etc.)
+        self.possible_agents = [f"agent_{i}" for i in range(self._num_agents)]
+        self.agents = self.possible_agents[:]
+
+        # Observation space: [x, y, power, norm_channel_gain, norm_interference, normalized_distance, one_hot_channel, one_hot_mode, congestion_level]
+        obs_dim = 5 + 1 + 3 + 3 + 1  # Total 13 dimensions
+        self.observation_spaces = {
+            agent: spaces.Box(low=0, high=1, shape=(obs_dim,), dtype=np.float32)
+            for agent in self.possible_agents
+        }
+
+        # Action space: (power, combined channel/mode)
+        # Power action: continuous [0.1, 1.0]
+        # Channel action: discrete choice among 3 channels
+        # Mode action: discrete choice among 3 modes (e.g., BPSK, QPSK, 16QAM)
+        power_space = spaces.Box(low=0.1, high=1.0, shape=(1,), dtype=np.float32)
+        combined_space = spaces.Discrete(9)  # 3 channels x 3 modes
+        act_space = spaces.Tuple((power_space, combined_space))
+        self.action_spaces = {agent: act_space for agent in self.possible_agents}
+
+        # Initialize positions, power, and destinations
+        self.devices = np.random.rand(self._num_agents, 2)
+        self.powers = np.random.uniform(0.1, 1.0, size=(self._num_agents,))
+        self.destinations = np.random.rand(self._num_agents, 2)
+
+        # Track each agent's chosen channel and mode
+        self.channels = np.zeros(self._num_agents, dtype=int)
+        self.modes = np.zeros(self._num_agents, dtype=int)
+
+        # Channel congestion level (how many agents are using each channel)
+        self.channel_congestion = np.zeros(3)
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.current_step = 0
+        self.agents = self.possible_agents[:]
+
+        # Random initial positions with minimum separation
+        self.devices = np.random.rand(self._num_agents, 2)
+        self.powers = np.random.uniform(0.1, 1.0, size=(self._num_agents,))
+        self.destinations = np.random.rand(self._num_agents, 2)
+
+        # Reset channel/mode choices
+        self.channels = np.zeros(self._num_agents, dtype=int)
+        self.modes = np.zeros(self._num_agents, dtype=int)
+        self.channel_congestion = np.zeros(3)
+        self.prev_channel_gains = None
+
+        obs = self._get_observations()
+        return obs, {}
+
+    def step(self, action_dict):
+        # Process actions for each agent
+        for i, agent_id in enumerate([a for a in self.agents if a in action_dict]):
+            idx = int(agent_id.split('_')[1])
+            action = action_dict[agent_id]
+            # Update power level (continuous action)
+            self.powers[idx] = np.clip(action[0][0], 0.1, 1.0)
+            # Update channel and mode selections (discrete action)
+            combined = action[1]
+            old_channel = self.channels[idx]
+            new_channel = combined // 3
+            # Update channel congestion tracking
+            if old_channel != new_channel:
+                self.channel_congestion[old_channel] = max(0, self.channel_congestion[old_channel] - 1)
+                self.channel_congestion[new_channel] += 1
+            self.channels[idx] = new_channel
+            self.modes[idx] = combined % 3
+
+        # Update positions based on mobility model (vectorized update)
+        self.devices = self._update_positions()
+
+        # Calculate channel conditions and interference
+        channel_gains = self._calculate_channel_gains()
+        interference = self._calculate_interference(channel_gains)
+
+        # Calculate performance metrics
+        throughput, sinr = self._calculate_throughput(channel_gains, interference)
+
+        # Get observations for next state
+        obs = self._get_observations()
+
+        # Calculate rewards and prepare info dictionaries
+        rewards = {}
+        infos = {}
+
+        max_throughput = 10.0  # Mbps, for normalization
+        norm_throughput = np.clip(throughput / max_throughput, 0, 1)
+        sinr = np.clip(sinr, 0, 30)  # Clip SINR for numerical stability
+
+        done = self.current_step >= self.max_steps
+        truncated = {agent_id: done for agent_id in self.agents}
+        truncated["__all__"] = done  # This line is critical!
+        dones = {agent_id: done for agent_id in self.agents}
+        dones["__all__"] = done
+
+        for i, agent_id in enumerate([a for a in self.agents]):
+            idx = int(agent_id.split('_')[1])
+            qos_threshold = 2.0  # Mbps
+            qos = 1.0 if throughput[idx] >= qos_threshold else 0.0
+
+            energy_efficiency = throughput[idx] / (self.powers[idx] + 1e-9)
+            norm_efficiency = np.clip(energy_efficiency / 50.0, 0, 1)
+
+            latency = 1000.0 / (throughput[idx] + 1e-9)  # ms
+            norm_latency = np.clip(1.0 - (latency / 1000.0), 0, 1)
+
+            norm_interference = np.clip(interference[idx] / 1000.0, 0, 1)
+            channel_idx = self.channels[idx]
+            congestion_penalty = self.channel_congestion[channel_idx] / self._num_agents
+
+            reward = (
+                4.0 * norm_throughput[idx] +   # Increased weight for throughput
+                1.5 * norm_efficiency +
+                1.0 * norm_latency +
+                -1.5 * norm_interference +      # Reduced penalty for interference
+                2.0 * qos +
+                -0.5 * congestion_penalty
+            )
+
+            mode = self.modes[idx]
+            if mode == 0 and self.powers[idx] < 0.5:
+                reward += 0.5
+            elif mode == 2 and throughput[idx] > 5.0:
+                reward += 0.5
+
+            rewards[agent_id] = reward
+
+            infos[agent_id] = {
+                "throughput_mbps": float(throughput[idx]),
+                "energy_efficiency": float(energy_efficiency),
+                "latency_ms": float(latency),
+                "interference": float(interference[idx]),
+                "qos": float(qos),
+                "sinr_db": float(10 * np.log10(sinr[idx] + 1e-9)),
+                "channel": int(self.channels[idx]),
+                "mode": int(self.modes[idx]),
+                "power": float(self.powers[idx]),
+                "position_x": float(self.devices[idx, 0]),
+                "position_y": float(self.devices[idx, 1])
+            }
+
+        self.current_step += 1
+        if done:
+            self.agents = []
+
+        return obs, rewards, dones, truncated, infos
+
+    def _update_positions(self):
+        """
+        Update device positions using a vectorized approach.
+        Devices that have reached their destination get assigned new random destinations.
+
+        Returns:
+            np.array: Updated device positions clipped to [0, 1].
+        """
+        vectors = self.destinations - self.devices
+        distances = np.linalg.norm(vectors, axis=1, keepdims=True)
+        reached = distances < self.speed
+        if np.any(reached):
+            self.destinations[reached.flatten()] = np.random.rand(np.sum(reached), 2)
+            vectors = self.destinations - self.devices
+            distances = np.linalg.norm(vectors, axis=1, keepdims=True)
+        direction = np.divide(vectors, distances, out=np.zeros_like(vectors), where=distances > 1e-9)
+        new_positions = self.devices + self.speed * direction
+        return np.clip(new_positions, 0, 1)
+
+    def _calculate_channel_gains(self):
+        """
+        Calculate channel gains using path loss, log-normal shadowing, Rayleigh fading, and temporal correlation.
+
+        Returns:
+            np.array: Channel gains matrix.
+        """
+        distances = np.linalg.norm(self.devices[:, None] - self.devices, axis=2) + 1e-6
+        path_loss = distances ** -self.path_loss_exponent
+        shadowing_db = np.random.normal(0, self.shadowing_std, size=(self._num_agents, self._num_agents))
+        shadowing = 10 ** (shadowing_db / 10)
+        fading = np.random.exponential(scale=self.fading_scale, size=(self._num_agents, self._num_agents))
+        channel_gains = path_loss * shadowing * fading
+        if self.prev_channel_gains is not None:
+            channel_gains = (self.channel_correlation * self.prev_channel_gains +
+                             (1 - self.channel_correlation) * channel_gains)
+        self.prev_channel_gains = channel_gains
+        return channel_gains
+
+    def _calculate_interference(self, channel_gains):
+        """
+        Calculate interference for each agent considering the selected channel.
+
+        Returns:
+            np.array: Interference values for each agent.
+        """
+        interference = np.zeros(self._num_agents)
+        for i in range(self._num_agents):
+            i_channel = self.channels[i]
+            for j in range(self._num_agents):
+                if j != i and self.channels[j] == i_channel:
+                    interference[i] += self.powers[j] * channel_gains[j, i]
+        return interference
+
+    def _calculate_throughput(self, channel_gains, interference):
+        """
+        Calculate throughput using Shannon capacity formula with mode-specific adjustments.
+
+        Returns:
+            tuple: (throughput, sinr) for each agent.
+        """
+        signal = self.powers * np.diag(channel_gains)
+        sinr = signal / (interference + self.noise_power)
+        throughput = np.zeros_like(sinr)
+        for i in range(self._num_agents):
+            mode = self.modes[i]
+            if mode == 0:
+                spectral_efficiency = np.log2(1 + sinr[i])
+            elif mode == 1:
+                spectral_efficiency = 1.5 * np.log2(1 + 0.8 * sinr[i])
+            else:
+                spectral_efficiency = 2.0 * np.log2(1 + 0.6 * sinr[i])
+            throughput[i] = self.bandwidth * spectral_efficiency / 1e6  # Mbps
+        return throughput, sinr
+
+    def _get_observations(self):
+        """
+        Generate observations for each agent.
+        Each observation includes position, power, normalized channel gain, normalized interference,
+        normalized distance to destination, one-hot encodings of channel and mode, and channel congestion.
+
+        Returns:
+            dict: Observations for each agent.
+        """
+        channel_gains = self._calculate_channel_gains()
+        interference = self._calculate_interference(channel_gains)
+        norm_congestion = self.channel_congestion / self._num_agents
+        obs = {}
+        for i in range(self._num_agents):
+            agent_id = f"agent_{i}"
+            if agent_id in self.agents:
+                distance_to_dest = np.linalg.norm(self.devices[i] - self.destinations[i])
+                # Normalize distance: max distance in a unit square is sqrt(2)
+                norm_distance = distance_to_dest / np.sqrt(2)
+                channel_one_hot = np.zeros(3)
+                channel_one_hot[self.channels[i]] = 1.0
+                mode_one_hot = np.zeros(3)
+                mode_one_hot[self.modes[i]] = 1.0
+                obs[agent_id] = np.concatenate([
+                    [self.devices[i, 0], self.devices[i, 1]],  # Position
+                    [self.powers[i]],                            # Power
+                    [np.clip(channel_gains[i, i], 0, 1)],        # Normalized channel gain
+                    [np.clip(interference[i], 0, 1)],            # Normalized interference
+                    [norm_distance],                             # Normalized distance to destination
+                    channel_one_hot,                             # Channel selection
+                    mode_one_hot,                                # Mode selection
+                    [norm_congestion[self.channels[i]]]          # Channel congestion level
+                ], dtype=np.float32)
+        return obs
+
+    # --- Add property methods for Gymnasium compatibility ---
+    @property
+    def action_space(self):
+        """
+        Return a representative action space.
+        Here, we choose the action space of the first agent.
+        """
+        return self.action_spaces[self.possible_agents[0]] if self.possible_agents else None
+
+    @property
+    def observation_space(self):
+        """
+        Return a representative observation space.
+        Here, we choose the observation space of the first agent.
+        """
+        return self.observation_spaces[self.possible_agents[0]] if self.possible_agents else None
+
+# =========================
+# RULE-BASED BASELINE POLICY (for comparison)
+# =========================
+def rule_based_policy(obs):
+    """
+    A simple rule-based policy for baseline comparison.
+
+    Args:
+        obs (np.array): Observation vector.
+
+    Returns:
+        tuple: (power, combined action) based on the observation.
+    """
+    pos_x, pos_y = obs[0], obs[1]
+    current_power = obs[2]
+    channel_gain = obs[3]
+    interference = obs[4]
+    if interference > 0.5:
+        power = np.array([max(0.1, current_power * 0.8)], dtype=np.float32)
+        channel = (int(pos_x * 3) + 1) % 3
+    else:
+        power = np.array([min(1.0, current_power * 1.2)], dtype=np.float32)
+        channel = int(pos_x * 3) % 3
+    if channel_gain < 0.3:
+        mode = 0
+    elif channel_gain < 0.7:
+        mode = 1
+    else:
+        mode = 2
+    combined = channel * 3 + mode
+    return (power, combined)
+
+# =========================
+# COMPREHENSIVE EVALUATION FUNCTION
+# =========================
+def evaluate_policy(trainer, num_episodes=10, env_config_extra=None, baseline=False):
+    """
+    Evaluate the policy performance over a number of episodes.
+
+    Args:
+        trainer: RLlib trainer instance.
+        num_episodes (int): Number of episodes to evaluate.
+        env_config_extra (dict): Extra environment configurations.
+        baseline (bool): If True, use the rule-based policy.
+
+    Returns:
+        dict: Average metrics computed over the episodes.
+    """
+    metrics = {
+        "throughput": [], "energy_efficiency": [], "latency": [],
+        "interference": [], "qos": [], "sinr_db": [],
+        "channel_utilization": [], "fairness": [], "spectral_efficiency": []
+    }
+    episode_agent_throughputs = []
+
+    config = {
+        "num_agents": NUM_AGENTS,
+        "max_steps": 100,
+        "bandwidth": 50e6,
+        "noise_power": 1e-10,
+        "speed": 0.01,
+        "path_loss_exponent": 3.5,
+        "fading_scale": 1.0,
+        "shadowing_std": 8.0,
+        "channel_correlation": 0.7
+    }
+    if env_config_extra:
+        config.update(env_config_extra)
+    env = D2DMultiAgentEnv(config)
+
+    for episode in range(num_episodes):
+        obs, _ = env.reset(seed=episode + 42)
+        done = False
+        ep_metrics = {
+            "throughput": [], "energy_efficiency": [], "latency": [],
+            "interference": [], "qos": [], "sinr_db": [],
+            "channel_counts": np.zeros(3)
+        }
+        agent_throughputs = {agent_id: [] for agent_id in env.possible_agents}
+
+        while not done:
+            actions = {}
+            for agent_id, agent_obs in obs.items():
+                if baseline:
+                    actions[agent_id] = rule_based_policy(agent_obs)
+                else:
+                    actions[agent_id] = trainer.compute_single_action(agent_obs, policy_id=agent_id)
+            obs, rewards, dones, _, infos = env.step(actions)
+            done = dones["__all__"]
+            for agent_id, info in infos.items():
+                if isinstance(info, dict):
+                    ep_metrics["throughput"].append(info["throughput_mbps"])
+                    ep_metrics["energy_efficiency"].append(info["energy_efficiency"])
+                    ep_metrics["latency"].append(info["latency_ms"])
+                    ep_metrics["interference"].append(info["interference"])
+                    ep_metrics["qos"].append(info["qos"])
+                    ep_metrics["sinr_db"].append(info["sinr_db"])
+                    ep_metrics["channel_counts"][info["channel"]] += 1
+                    agent_throughputs[agent_id].append(info["throughput_mbps"])
+        for key in ["throughput", "energy_efficiency", "latency", "interference", "qos", "sinr_db"]:
+            metrics[key].append(np.mean(ep_metrics[key]))
+        channel_util = 1 - np.std(ep_metrics["channel_counts"]) / np.sum(ep_metrics["channel_counts"])
+        metrics["channel_utilization"].append(channel_util)
+        spectral_efficiency = np.mean(ep_metrics["throughput"]) / (env.bandwidth / 1e6)
+        metrics["spectral_efficiency"].append(spectral_efficiency)
+        episode_agent_throughputs.append({agent: np.mean(vals) for agent, vals in agent_throughputs.items()})
+    fairness_indices = []
+    for ep_throughputs in episode_agent_throughputs:
+        values = list(ep_throughputs.values())
+        fairness = np.sum(values)**2 / (len(values) * np.sum(np.array(values)**2))
+        fairness_indices.append(fairness)
+    metrics["fairness"] = fairness_indices
+    avg_metrics = {key: float(np.mean(values)) for key, values in metrics.items()}
+    avg_metrics["qos_rate"] = avg_metrics["qos"] * 100.0
+    avg_metrics["system_capacity"] = avg_metrics["throughput"] * NUM_AGENTS
+    return avg_metrics
+
+# =========================
+# OPTIMIZED PPO CONFIGURATION
+# =========================
+def create_ppo_config(num_agents=NUM_AGENTS):
+    """
+    Create an optimized PPO configuration for the D2D environment.
+
+    Returns:
+        PPOConfig: Configured PPO algorithm.
+    """
+    policies = {
+        f"agent_{i}": PolicySpec(
+            observation_space=spaces.Box(low=0, high=1, shape=(13,), dtype=np.float32),
+            action_space=spaces.Tuple((
+                spaces.Box(low=0.1, high=1.0, shape=(1,), dtype=np.float32),
+                spaces.Discrete(9)
+            )),
+            config={}
+        ) for i in range(num_agents)
+    }
+    return (
+        PPOConfig()
+        .api_stack(enable_rl_module_and_learner=False, enable_env_runner_and_connector_v2=False)
+        .environment(
+            env="D2D-MA-v0",   # Use the registered environment ID
+            env_config={
+                "num_agents": num_agents,
+                "max_steps": 100,
+                "bandwidth": 50e6,
+                "noise_power": 1e-10,
+                "speed": 0.01,
+                "path_loss_exponent": 3.5,
+                "fading_scale": 1.0,
+                "shadowing_std": 8.0,
+                "channel_correlation": 0.7
+            },
+            disable_env_checker=True  # Disable checker for multi-agent envs
+        )
+        .framework("torch")
+        .env_runners(num_env_runners=1, num_cpus_per_env_runner=1, rollout_fragment_length=128)
+        .training(
+            train_batch_size=1024,
+            minibatch_size=128,
+            num_sgd_iter=10,
+            lr=5e-4,
+            lr_schedule=[[0, 5e-4], [5000000, 1e-4]],
+            gamma=0.99,
+            lambda_=0.95,
+            kl_coeff=0.2,
+            clip_param=0.2,
+            vf_clip_param=10.0,
+            entropy_coeff=0.01,
+            entropy_coeff_schedule=[[0, 0.01], [5000000, 0.001]],
+            model={
+                "fcnet_hiddens": [128, 128],
+                "fcnet_activation": "relu",
+                "vf_share_layers": False,
+            }
+        )
+        .multi_agent(
+            policies=policies,
+            policy_mapping_fn=multi_policy_mapping_fn,
+            policies_to_train=list(policies.keys())
+        )
+        .resources(num_gpus=0)
+    )
+
+# =========================
+# HYPERPARAMETER TUNING FUNCTION (Using Ray Tune)
+# =========================
+def tune_hyperparameters():
+    """
+    Run hyperparameter tuning to find the optimal configuration.
+
+    Returns:
+        dict: Best configuration found.
+    """
+    analysis = tune.run(
+        "PPO",
+        config={
+            "env": D2DMultiAgentEnv,
+            "env_config": {"num_agents": NUM_AGENTS},
+            "lr": tune.grid_search([1e-4, 5e-4, 1e-3]),
+            "gamma": tune.grid_search([0.95, 0.99]),
+            "lambda": tune.grid_search([0.9, 0.95, 1.0]),
+            "clip_param": tune.grid_search([0.1, 0.2, 0.3]),
+            "entropy_coeff": tune.grid_search([0.0, 0.01, 0.02]),
+            "train_batch_size": tune.grid_search([512, 1024, 2048]),
+            "sgd_minibatch_size": tune.grid_search([64, 128, 256]),
+            "num_sgd_iter": tune.grid_search([10, 20]),
+        },
+        num_samples=3,
+        stop={"training_iteration": 50},
+        storage_path="C:/ray_results",  # NEW preferred key (local_dir is deprecated)
+        trial_dirname_creator=lambda trial: f"trial_{trial.trial_id}"
+    )
+    return analysis.best_config
+
+# =========================
+# VISUALIZATION FUNCTION
+# =========================
+def visualize_agent_trajectories(env_history, save_path=None):
+    """
+    Visualize agent trajectories over an episode.
+
+    Args:
+        env_history (list): A list of dictionaries with agent positions at each time step.
+        save_path (str): Optional path to save the plot.
+    """
+    plt.figure(figsize=(10, 10))
+    for agent_idx in range(NUM_AGENTS):
+        positions = np.array([step[f"agent_{agent_idx}"]["position"] for step in env_history if f"agent_{agent_idx}" in step])
+        plt.plot(positions[:, 0], positions[:, 1], '-o', label=f"Agent {agent_idx}", alpha=0.7)
+        plt.scatter(positions[0, 0], positions[0, 1], marker='>', s=100)  # Start
+        plt.scatter(positions[-1, 0], positions[-1, 1], marker='s', s=100)  # End
+    plt.xlim(0, 1)
+    plt.ylim(0, 1)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.title("Agent Trajectories")
+    if save_path:
+        plt.savefig(save_path)
+    plt.show()
+
+# =========================
+# UNIT TEST FOR CHANNEL GAIN CALCULATION
+# =========================
+def test_channel_gain_calculation():
+    """
+    Test the _calculate_channel_gains function for correctness.
+    """
+    env = D2DMultiAgentEnv({"num_agents": 2})
+    env.devices = np.array([[0.1, 0.1], [0.5, 0.5]])
+    gains = env._calculate_channel_gains()
+    assert gains.shape == (2, 2), "Channel gains matrix has incorrect shape."
+    assert np.all(gains >= 0), "Channel gains must be non-negative."
+    print("Channel gain calculation test passed.")
+
+# =========================
+# IMPROVED TRAINING FUNCTION
+# =========================
+def train_and_evaluate(num_iterations=300, save_dir="d2d_results"):
+    """
+    Train and evaluate the D2D multi-agent system with comprehensive metrics.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    experiment_id = f"d2d_multiagent_{timestamp}"
+    os.makedirs(save_dir, exist_ok=True)
+    results_path = os.path.join(save_dir, experiment_id)
+    os.makedirs(results_path, exist_ok=True)
+
+    ppo_config = create_ppo_config()
+    trainer = ppo_config.build_algo()
+
+    metrics_history = []
+    training_rewards = []
+    baseline_metrics = None
+
+    # Optional: Early stopping parameters
+    patience = 10
+    best_metric = -np.inf
+    no_improve_count = 0
+
+    print(f"\n{'='*20} TRAINING {'='*20}")
+    start_time = time.time()
+
+    for i in tqdm(range(num_iterations), desc="Training Progress"):
+        result = trainer.train()
+        iter_reward = result.get("episode_reward_mean", 0)
+        training_rewards.append(iter_reward)
+
+        if i % 10 == 0 or i == num_iterations - 1:
+            tqdm.write(f"Iteration {i}: episode_reward_mean={iter_reward:.2f}")
+            eval_metrics = evaluate_policy(trainer, num_episodes=10)
+            metrics_history.append((i, eval_metrics))
+            tqdm.write(
+                f"[Eval @ {i}] "
+                f"Throughput: {eval_metrics['throughput']:.2f} Mbps, "
+                f"Efficiency: {eval_metrics['energy_efficiency']:.2f}, "
+                f"Latency: {eval_metrics['latency']:.2f} ms, "
+                f"SINR: {eval_metrics['sinr_db']:.2f} dB, "
+                f"QoS: {eval_metrics['qos_rate']:.1f}%, "
+                f"Fairness: {eval_metrics['fairness']:.3f}"
+            )
+            # Early stopping check (using throughput as an example)
+            if eval_metrics["throughput"] > best_metric:
+                best_metric = eval_metrics["throughput"]
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+            if no_improve_count >= patience:
+                tqdm.write(f"No improvement for {patience} iterations, stopping early.")
+                break
+            if i % 50 == 0 and i > 0:
+                checkpoint_path = os.path.join(results_path, f"checkpoint_{i}")
+                trainer.save(checkpoint_path)
+
+    training_time = time.time() - start_time
+    print(f"\nTraining completed in {training_time:.2f} seconds")
+
+    print(f"\n{'='*20} FINAL EVALUATION {'='*20}")
+
+    print("\nEvaluating rule-based baseline policy...")
+    baseline_metrics = evaluate_policy(trainer, num_episodes=20, baseline=True)
+
+    print("\nEvaluating trained policy on base environment...")
+    final_eval_base = evaluate_policy(trainer, num_episodes=20)
+
+    print("\nEvaluating generalization to faster mobility...")
+    final_eval_mobility = evaluate_policy(
+        trainer,
+        num_episodes=20,
+        env_config_extra={"speed": 0.02}
+    )
+
+    print("\nEvaluating generalization to more agents (using trained agent count)...")
+    final_eval_density = evaluate_policy(
+        trainer,
+        num_episodes=20,
+        env_config_extra={"num_agents": NUM_AGENTS}
+    )
+
+    print("\nEvaluating generalization to different channel conditions...")
+    final_eval_channel = evaluate_policy(
+        trainer,
+        num_episodes=20,
+        env_config_extra={"path_loss_exponent": 4.0, "shadowing_std": 10.0}
+    )
+
+    print("\n" + "="*50)
+    print("FINAL RESULTS (PUBLICATION-READY METRICS)")
+    print("="*50)
+
+    metrics_table = pd.DataFrame({
+        'Metric': [
+            'System Capacity (Mbps)',
+            'Average Throughput (Mbps)',
+            'Energy Efficiency',
+            'Latency (ms)',
+            'SINR (dB)',
+            'QoS Satisfaction (%)',
+            'Channel Utilization',
+            'Fairness Index',
+            'Spectral Efficiency (bps/Hz)'
+        ],
+        'Baseline': [
+            baseline_metrics['throughput'] * NUM_AGENTS,
+            baseline_metrics['throughput'],
+            baseline_metrics['energy_efficiency'],
+            baseline_metrics['latency'],
+            baseline_metrics['sinr_db'],
+            baseline_metrics['qos_rate'],
+            baseline_metrics['channel_utilization'],
+            baseline_metrics['fairness'],
+            baseline_metrics['spectral_efficiency']
+        ],
+        'Proposed': [
+            final_eval_base['throughput'] * NUM_AGENTS,
+            final_eval_base['throughput'],
+            final_eval_base['energy_efficiency'],
+            final_eval_base['latency'],
+            final_eval_base['sinr_db'],
+            final_eval_base['qos_rate'],
+            final_eval_base['channel_utilization'],
+            final_eval_base['fairness'],
+            final_eval_base['spectral_efficiency']
+        ]
+    })
+
+    print(metrics_table)
+    return metrics_history, training_rewards
+
+# =========================
+# MAIN EXECUTION (with tests)
+# =========================
+if __name__ == "__main__":
+    # Run unit tests
+    test_channel_gain_calculation()
+
+    # Optionally, run hyperparameter tuning (uncomment if needed)
+    best_config = tune_hyperparameters()
+    print("Best hyperparameters:", best_config)
+
+    # Train and evaluate the model
+    train_and_evaluate(num_iterations=300, save_dir="d2d_results")
